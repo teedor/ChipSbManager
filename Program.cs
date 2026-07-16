@@ -102,6 +102,8 @@ async Task PreviewAsync()
     long scanned = 0, matched = 0;
     long fromSequence = 0;
     var samplesShown = 0;
+    var total = await TryGetActiveCountAsync();
+    var started = System.Diagnostics.Stopwatch.StartNew();
 
     Console.WriteLine("Peeking through the queue (messages are not locked or modified)...");
 
@@ -122,17 +124,18 @@ async Task PreviewAsync()
                     samplesShown++;
                     var preview = message.Body.ToString();
                     if (preview.Length > 120) preview = preview[..120] + "...";
+                    Console.WriteLine();
                     Console.WriteLine($"  sample match (id {message.MessageId}): {preview}");
                 }
             }
         }
 
         fromSequence = batch[^1].SequenceNumber + 1;
-        if (scanned % 1000 < BatchSize)
-            Console.WriteLine($"  scanned {scanned:N0}, matched {matched:N0}...");
+        WriteProgress($"  scanned {Progress(scanned, total, started)} | matched {matched:N0}");
     }
 
-    Console.WriteLine($"Done. Scanned {scanned:N0} messages; {matched:N0} contain \"{searchText}\".");
+    Console.WriteLine();
+    Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Scanned {scanned:N0} messages; {matched:N0} contain \"{searchText}\".");
 }
 
 async Task DeleteAsync()
@@ -149,6 +152,10 @@ async Task DeleteAsync()
         return;
     }
 
+    Console.Write("Max messages to process this run (Enter = all): ");
+    var limitInput = Console.ReadLine()?.Trim();
+    long? limit = long.TryParse(limitInput, out var lim) && lim > 0 ? lim : null;
+
     Directory.CreateDirectory("backups");
     var backupPath = Path.Combine("backups", $"{queueName}-{DateTime.Now:yyyyMMdd-HHmmss}.jsonl");
     await using var backup = new StreamWriter(backupPath);
@@ -159,63 +166,86 @@ async Task DeleteAsync()
 
     long scanned = 0, deleted = 0, requeued = 0;
     var reachedOwnClones = false;
+    var activeCount = await TryGetActiveCountAsync();
+    var total = limit is null ? activeCount : Math.Min(limit.Value, activeCount ?? limit.Value);
+    var started = System.Diagnostics.Stopwatch.StartNew();
 
     Console.WriteLine($"Backing up matches to {backupPath}");
-    Console.WriteLine("Processing...");
+    Console.WriteLine(limit is null ? "Processing entire queue..." : $"Processing up to {limit:N0} messages...");
 
-    while (!reachedOwnClones)
+    while (!reachedOwnClones && (limit is null || scanned < limit))
     {
         var batch = await receiver.ReceiveMessagesAsync(BatchSize, TimeSpan.FromSeconds(5));
         if (batch.Count == 0)
             break; // queue drained
 
+        // Split the batch: matches get backed up + deleted, everything else is
+        // re-queued as a fresh clone (delivery count resets to 0). A message tagged
+        // with this run's ID is one of our own clones — FIFO order means every
+        // original has now been seen, so this is the last batch.
+        var matches = new List<ServiceBusReceivedMessage>();
+        var others = new List<ServiceBusReceivedMessage>();
         foreach (var message in batch)
         {
             var isOwnClone = message.ApplicationProperties.TryGetValue(RunIdProperty, out var tag)
                              && (string?)tag == runId;
+            reachedOwnClones |= isOwnClone;
+            if (!isOwnClone && IsMatch(message)) matches.Add(message);
+            else others.Add(message);
+        }
 
-            if (!isOwnClone && IsMatch(message))
+        foreach (var message in matches)
+        {
+            await backup.WriteLineAsync(JsonSerializer.Serialize(new
             {
-                await backup.WriteLineAsync(JsonSerializer.Serialize(new
-                {
-                    message.MessageId,
-                    message.SequenceNumber,
-                    message.EnqueuedTime,
-                    message.Subject,
-                    message.ContentType,
-                    message.CorrelationId,
-                    ApplicationProperties = message.ApplicationProperties
-                        .ToDictionary(p => p.Key, p => p.Value?.ToString()),
-                    Body = message.Body.ToString(),
-                }));
-                await backup.FlushAsync();
-                await receiver.CompleteMessageAsync(message);
-                deleted++;
-            }
-            else
+                message.MessageId,
+                message.SequenceNumber,
+                message.EnqueuedTime,
+                message.Subject,
+                message.ContentType,
+                message.CorrelationId,
+                ApplicationProperties = message.ApplicationProperties
+                    .ToDictionary(p => p.Key, p => p.Value?.ToString()),
+                Body = message.Body.ToString(),
+            }));
+        }
+        await backup.FlushAsync();
+
+        // Send all clones before completing anything: a crash mid-batch can at
+        // worst duplicate messages, never lose one.
+        if (others.Count > 0)
+        {
+            var messageBatch = await sender.CreateMessageBatchAsync();
+            foreach (var message in others)
             {
-                // Re-queue as a fresh message so its delivery count resets to 0.
-                // Send before completing: a crash here duplicates a message, never loses one.
                 var clone = new ServiceBusMessage(message);
                 clone.ApplicationProperties[RunIdProperty] = runId;
-                await sender.SendMessageAsync(clone);
-                await receiver.CompleteMessageAsync(message);
-                requeued++;
+                if (!messageBatch.TryAddMessage(clone))
+                {
+                    await sender.SendMessagesAsync(messageBatch);
+                    messageBatch.Dispose();
+                    messageBatch = await sender.CreateMessageBatchAsync();
+                    if (!messageBatch.TryAddMessage(clone))
+                        await sender.SendMessageAsync(clone); // single oversized message
+                }
             }
-
-            if (isOwnClone)
-            {
-                reachedOwnClones = true; // FIFO: every original has now been seen
-                break;
-            }
-
-            scanned++;
-            if (scanned % 500 == 0)
-                Console.WriteLine($"  processed {scanned:N0} (deleted {deleted:N0}, re-queued {requeued:N0})...");
+            if (messageBatch.Count > 0)
+                await sender.SendMessagesAsync(messageBatch);
+            messageBatch.Dispose();
         }
+
+        await Task.WhenAll(batch.Select(m => receiver.CompleteMessageAsync(m)));
+
+        deleted += matches.Count;
+        requeued += others.Count;
+        scanned += batch.Count;
+        WriteProgress($"  processed {Progress(scanned, total, started)} | deleted {deleted:N0} | re-queued {requeued:N0}");
     }
 
-    Console.WriteLine($"Done. Processed {scanned:N0} messages: deleted {deleted:N0}, re-queued {requeued:N0}.");
+    Console.WriteLine();
+    Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Processed {scanned:N0} messages: deleted {deleted:N0}, re-queued {requeued:N0}.");
+    if (limit is not null && scanned >= limit && !reachedOwnClones)
+        Console.WriteLine("Stopped at the run limit — run Delete again to continue where this left off.");
     Console.WriteLine(deleted > 0
         ? $"Backup of deleted messages: {backupPath}"
         : "No messages matched; backup file is empty.");
@@ -266,6 +296,41 @@ async Task ShowQueueCountsAsync()
     {
         Console.WriteLine($"(Could not read queue counts — connection string may lack Manage rights: {ex.Message})");
     }
+}
+
+async Task<long?> TryGetActiveCountAsync()
+{
+    try
+    {
+        var admin = new ServiceBusAdministrationClient(connectionString);
+        var props = (await admin.GetQueueRuntimePropertiesAsync(queueName)).Value;
+        return props.ActiveMessageCount;
+    }
+    catch
+    {
+        return null; // no Manage rights — progress shows counts without percentage/ETA
+    }
+}
+
+string Progress(long done, long? total, System.Diagnostics.Stopwatch started)
+{
+    var rate = done / Math.Max(started.Elapsed.TotalSeconds, 0.001);
+    var text = total is > 0
+        ? $"{done:N0} / ~{total:N0} ({Math.Min(100, done * 100 / total.Value)}%)"
+        : $"{done:N0}";
+    text += $" | {rate:N0}/s";
+    if (total is > 0 && rate > 0 && done < total)
+    {
+        var eta = TimeSpan.FromSeconds((total.Value - done) / rate);
+        text += $" | ETA {eta:mm\\:ss}";
+    }
+    return text;
+}
+
+void WriteProgress(string text)
+{
+    // Rewrite a single console line in place; pad to erase leftovers from longer lines.
+    Console.Write($"\r{text,-90}");
 }
 
 string PromptForSearchText()

@@ -36,6 +36,14 @@ The app prompts for a search string, then offers:
   (body, message ID, properties, enqueue time), then deletes it. Requires typing
   `DELETE` to confirm.
 
+Both operations show live progress (count, percentage, rate, ETA — percentage and
+ETA need Manage rights on the connection string to read the queue's total).
+
+Delete can optionally be limited to N messages per run. Stopping early — via the
+limit, Ctrl+C, or a crash — is always safe: each message is either untouched or
+fully processed, so simply run Delete again to continue where the last run
+stopped.
+
 ## How delete works (and why)
 
 Service Bus has no server-side content search, so every message must be received
