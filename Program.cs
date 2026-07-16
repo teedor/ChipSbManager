@@ -77,6 +77,7 @@ while (true)
     Console.WriteLine("  [2] Delete  — back up & delete matches, re-queue everything else");
     Console.WriteLine("  [3] Filter by search text");
     Console.WriteLine("  [4] Filter by CSV of item IDs (matches \"ItemId\":<id> in bodies)");
+    Console.WriteLine("  [5] Watch queue counts (refreshes every 10s)");
     Console.WriteLine("  [Q] Quit");
     Console.Write("> ");
 
@@ -95,6 +96,9 @@ while (true)
             break;
         case "4":
             SetCsvFilter();
+            break;
+        case "5":
+            await RunLoggedAsync("watch", WatchCountsAsync);
             break;
         case "q":
             return 0;
@@ -522,6 +526,36 @@ async Task RunLoggedAsync(string operation, Func<Task> action)
             Console.WriteLine("needs outbound TCP port 5671, which is often blocked on restricted networks.");
             Console.WriteLine("Try setting \"ServiceBus\": { \"UseWebSockets\": true } in appsettings.json");
             Console.WriteLine("to tunnel AMQP over port 443 instead (the port the queue counts already use).");
+        }
+    }
+}
+
+async Task WatchCountsAsync()
+{
+    var admin = new ServiceBusAdministrationClient(connectionString);
+    Console.WriteLine("Watching queue counts — one line per refresh, press any key to stop.");
+
+    while (true)
+    {
+        try
+        {
+            var props = (await admin.GetQueueRuntimePropertiesAsync(queueName)).Value;
+            Console.WriteLine($"  {DateTime.Now:HH:mm:ss}  active {props.ActiveMessageCount:N0} | dead-lettered {props.DeadLetterMessageCount:N0} | scheduled {props.ScheduledMessageCount:N0}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  {DateTime.Now:HH:mm:ss}  (failed to read counts: {ex.Message})");
+        }
+
+        // Wait 10s in short slices so a key press is noticed promptly.
+        for (var i = 0; i < 100; i++)
+        {
+            if (Console.KeyAvailable)
+            {
+                Console.ReadKey(intercept: true);
+                return;
+            }
+            await Task.Delay(100);
         }
     }
 }
