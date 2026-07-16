@@ -27,17 +27,16 @@ backing them up to a local file.
 
 ## Usage
 
-The app prompts for a search string, then offers:
-
-Two filter types are available (menu options 3 and 4):
+The app starts at a menu. Set a filter first (option 3 or 4):
 
 - **Search text** — substring match against the message body, optionally
   case-sensitive.
 - **CSV of item IDs** — reads integer IDs from a CSV file (default
   `itemIds.csv`; header row and blank/non-numeric rows are skipped). A message
-  matches when its body contains `"ItemId":<id>` for any listed ID. Matching
-  tolerates whitespace around the colon, key casing, and quoted values, and is
-  boundary-safe: ID `449594` never matches `"ItemId":4495945` and vice versa.
+  matches when its body contains `"ItemId":<id>,` for any listed ID (the value
+  is always followed by a comma in these messages). Matching tolerates
+  whitespace around the colon and key casing, and is boundary-safe: ID `449594`
+  never matches `"ItemId":4495945,` and vice versa.
 
 Preview and Delete both operate on whichever filter is currently active:
 

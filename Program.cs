@@ -58,17 +58,16 @@ Console.WriteLine($"Queue: {queueName} | transport: {clientOptions.TransportType
 await ShowQueueCountsAsync();
 Console.WriteLine();
 
-// Matches "ItemId":<digits> in message bodies, tolerating whitespace around the
-// colon, key casing, and a quoted value. \d+ is greedy, so the captured number is
-// the complete value — ID 449594 can never partially match "ItemId":4495945.
-var itemIdRegex = new Regex("\"ItemId\"\\s*:\\s*\"?(\\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+// Matches "ItemId":<digits>, in message bodies — the value is always followed by
+// a comma, so require it. Whitespace around the colon and key casing are tolerated.
+// The comma (and greedy \d+) make matching boundary-safe: ID 449594 can never
+// partially match "ItemId":4495945,
+var itemIdRegex = new Regex("\"ItemId\"\\s*:\\s*(\\d+)\\s*,", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 var searchText = "";
 var comparison = StringComparison.OrdinalIgnoreCase;
 HashSet<long>? itemIds = null; // non-null → CSV item-ID filter is active
-var filterDescription = "";
-
-SetTextFilter();
+var filterDescription = "(none — choose option 3 or 4 first)";
 
 while (true)
 {
@@ -84,10 +83,12 @@ while (true)
     switch (Console.ReadLine()?.Trim().ToLowerInvariant())
     {
         case "1":
-            await RunLoggedAsync("preview", PreviewAsync);
+            if (FilterIsSet())
+                await RunLoggedAsync("preview", PreviewAsync);
             break;
         case "2":
-            await RunLoggedAsync("delete", DeleteAsync);
+            if (FilterIsSet())
+                await RunLoggedAsync("delete", DeleteAsync);
             break;
         case "3":
             SetTextFilter();
@@ -98,6 +99,14 @@ while (true)
         case "q":
             return 0;
     }
+}
+
+bool FilterIsSet()
+{
+    if (itemIds is not null || searchText.Length > 0)
+        return true;
+    Console.WriteLine("No filter set yet — choose [3] to search by text or [4] to load a CSV of item IDs.");
+    return false;
 }
 
 void SetTextFilter()
