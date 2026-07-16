@@ -57,6 +57,15 @@ fresh clone (same body, message ID, and properties; delivery count reset to 0)
 before the original is completed. The clone is sent before the original is
 completed, so a crash mid-run can at worst duplicate a message, never lose one.
 
+A single receive pass can't be trusted to see every message: partitioned queues
+don't deliver strictly FIFO, and deferred/scheduled messages never appear in a
+normal receive (though peek counts them). So after each pass, delete re-peeks
+the queue (read-only) and only reports success once **zero** matches remain,
+running further passes if needed (up to 5 per run). Deferred matches are
+deleted via receive-by-sequence-number and scheduled matches via
+cancel-scheduled-message; preview shows a breakdown by message state whenever
+deferred/scheduled matches exist.
+
 Consequences of a delete run:
 
 - **Pause consumers first.** The tool competes for messages with anything else
