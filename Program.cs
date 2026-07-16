@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Azure.Messaging.ServiceBus;
 using Azure.Messaging.ServiceBus.Administration;
 using Microsoft.Extensions.Configuration;
@@ -57,16 +58,26 @@ Console.WriteLine($"Queue: {queueName} | transport: {clientOptions.TransportType
 await ShowQueueCountsAsync();
 Console.WriteLine();
 
-var searchText = PromptForSearchText();
-var comparison = PromptForCaseSensitivity();
+// Matches "ItemId":<digits> in message bodies, tolerating whitespace around the
+// colon, key casing, and a quoted value. \d+ is greedy, so the captured number is
+// the complete value — ID 449594 can never partially match "ItemId":4495945.
+var itemIdRegex = new Regex("\"ItemId\"\\s*:\\s*\"?(\\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+var searchText = "";
+var comparison = StringComparison.OrdinalIgnoreCase;
+HashSet<long>? itemIds = null; // non-null → CSV item-ID filter is active
+var filterDescription = "";
+
+SetTextFilter();
 
 while (true)
 {
     Console.WriteLine();
-    Console.WriteLine($"Search string: \"{searchText}\" ({(comparison == StringComparison.Ordinal ? "case-sensitive" : "case-insensitive")})");
+    Console.WriteLine($"Filter: {filterDescription}");
     Console.WriteLine("  [1] Preview — count matching messages (non-destructive)");
     Console.WriteLine("  [2] Delete  — back up & delete matches, re-queue everything else");
-    Console.WriteLine("  [3] Change search string");
+    Console.WriteLine("  [3] Filter by search text");
+    Console.WriteLine("  [4] Filter by CSV of item IDs (matches \"ItemId\":<id> in bodies)");
     Console.WriteLine("  [Q] Quit");
     Console.Write("> ");
 
@@ -79,12 +90,60 @@ while (true)
             await RunLoggedAsync("delete", DeleteAsync);
             break;
         case "3":
-            searchText = PromptForSearchText();
-            comparison = PromptForCaseSensitivity();
+            SetTextFilter();
+            break;
+        case "4":
+            SetCsvFilter();
             break;
         case "q":
             return 0;
     }
+}
+
+void SetTextFilter()
+{
+    searchText = PromptForSearchText();
+    comparison = PromptForCaseSensitivity();
+    itemIds = null;
+    filterDescription = $"bodies containing \"{searchText}\" ({(comparison == StringComparison.Ordinal ? "case-sensitive" : "case-insensitive")})";
+}
+
+void SetCsvFilter()
+{
+    Console.Write("Path to CSV file [itemIds.csv]: ");
+    var path = Console.ReadLine()?.Trim();
+    if (string.IsNullOrEmpty(path))
+        path = "itemIds.csv";
+    if (!File.Exists(path))
+    {
+        Console.WriteLine($"File not found: {Path.GetFullPath(path)} — filter unchanged.");
+        return;
+    }
+
+    var ids = new HashSet<long>();
+    long skipped = 0;
+    foreach (var line in File.ReadLines(path))
+    {
+        var cell = line.Split(',')[0].Trim().Trim('"');
+        if (cell.Length == 0)
+            continue;
+        if (long.TryParse(cell, out var id))
+            ids.Add(id);
+        else
+            skipped++; // e.g. the "Id" header row
+    }
+
+    if (ids.Count == 0)
+    {
+        Console.WriteLine("No numeric IDs found in the file — filter unchanged.");
+        return;
+    }
+
+    itemIds = ids;
+    filterDescription = $"bodies where \"ItemId\":<id> matches one of {ids.Count:N0} IDs from {Path.GetFileName(path)}";
+    Console.WriteLine($"Loaded {ids.Count:N0} unique item IDs"
+                      + (skipped > 0 ? $" ({skipped:N0} non-numeric row(s) skipped, e.g. the header)" : "")
+                      + ".");
 }
 
 bool IsMatch(ServiceBusReceivedMessage message)
@@ -96,8 +155,19 @@ bool IsMatch(ServiceBusReceivedMessage message)
     }
     catch
     {
-        return false; // non-text body can't contain the search string
+        return false; // non-text body can't match either filter
     }
+
+    if (itemIds is not null)
+    {
+        foreach (Match m in itemIdRegex.Matches(body))
+        {
+            if (long.TryParse(m.Groups[1].Value, out var id) && itemIds.Contains(id))
+                return true;
+        }
+        return false;
+    }
+
     return body.Contains(searchText, comparison);
 }
 
@@ -148,7 +218,7 @@ async Task PreviewAsync()
 
     var matched = matchedActive + matchedDeferred + matchedScheduled;
     Console.WriteLine();
-    Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Scanned {scanned:N0} messages; {matched:N0} contain \"{searchText}\".");
+    Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Scanned {scanned:N0} messages; {matched:N0} match the filter.");
     if (matchedDeferred > 0 || matchedScheduled > 0)
         Console.WriteLine($"  breakdown: {matchedActive:N0} active, {matchedDeferred:N0} deferred, {matchedScheduled:N0} scheduled — Delete handles all three.");
 }
@@ -156,7 +226,8 @@ async Task PreviewAsync()
 async Task DeleteAsync()
 {
     Console.WriteLine();
-    Console.WriteLine($"This will DELETE every message containing \"{searchText}\" from '{queueName}'.");
+    Console.WriteLine($"This will DELETE every message from '{queueName}' matching:");
+    Console.WriteLine($"  {filterDescription}");
     Console.WriteLine("Matches are backed up to a local file first. All other messages are");
     Console.WriteLine("re-queued as fresh copies (new enqueue time, back of the queue).");
     Console.WriteLine("Make sure consumers of this queue are paused before continuing.");

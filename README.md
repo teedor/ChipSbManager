@@ -29,8 +29,20 @@ backing them up to a local file.
 
 The app prompts for a search string, then offers:
 
-- **Preview** — peeks through the whole queue and counts messages containing the
-  string. Completely non-destructive: peeking doesn't lock messages or touch
+Two filter types are available (menu options 3 and 4):
+
+- **Search text** — substring match against the message body, optionally
+  case-sensitive.
+- **CSV of item IDs** — reads integer IDs from a CSV file (default
+  `itemIds.csv`; header row and blank/non-numeric rows are skipped). A message
+  matches when its body contains `"ItemId":<id>` for any listed ID. Matching
+  tolerates whitespace around the colon, key casing, and quoted values, and is
+  boundary-safe: ID `449594` never matches `"ItemId":4495945` and vice versa.
+
+Preview and Delete both operate on whichever filter is currently active:
+
+- **Preview** — peeks through the whole queue and counts matching messages.
+  Completely non-destructive: peeking doesn't lock messages or touch
   delivery counts, so it's always safe to run.
 - **Delete** — backs up each matching message to `backups/<queue>-<timestamp>.jsonl`
   (body, message ID, properties, enqueue time), then deletes it. Requires typing
