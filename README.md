@@ -47,6 +47,10 @@ Preview and Delete both operate on whichever filter is currently active:
   (body, message ID, properties, enqueue time), then deletes it. Requires typing
   `DELETE` to confirm.
 
+There is also a **watch** option that prints the queue's active /
+dead-lettered / scheduled counts every 10 seconds (one timestamped line per
+refresh, so you can see the trend during a big delete); press any key to stop.
+
 Both operations show live progress (count, percentage, rate, ETA — percentage and
 ETA need Manage rights on the connection string to read the queue's total).
 
