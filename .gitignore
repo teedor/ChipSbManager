@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+
+# Local secrets — copy appsettings.example.json to appsettings.json and fill in
+appsettings.json
+
+# Message backups from delete runs
+backups/
+
+# IDE
+.vs/
+.idea/
+*.user
+.DS_Store
