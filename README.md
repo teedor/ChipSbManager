@@ -14,6 +14,11 @@ backing them up to a local file.
 
    `appsettings.json` is gitignored so the connection string is never committed.
 
+   On restricted networks (e.g. ExpressRoute with no internet egress) where
+   outbound TCP port 5671 is blocked, set `"UseWebSockets": true` to tunnel
+   AMQP over port 443 instead. Symptom of needing this: the queue counts at
+   startup work (they use HTTPS/443) but peek/receive hangs and times out.
+
 2. Run:
 
    ```sh

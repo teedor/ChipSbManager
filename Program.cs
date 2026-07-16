@@ -24,6 +24,8 @@ var config = new ConfigurationBuilder()
 var connectionString = config["ServiceBus:ConnectionString"];
 var queueName = config["ServiceBus:QueueName"];
 
+var useWebSockets = bool.TryParse(config["ServiceBus:UseWebSockets"], out var ws) && ws;
+
 if (string.IsNullOrWhiteSpace(connectionString) || string.IsNullOrWhiteSpace(queueName)
     || connectionString.Contains("<your-"))
 {
@@ -33,10 +35,19 @@ if (string.IsNullOrWhiteSpace(connectionString) || string.IsNullOrWhiteSpace(que
     return 1;
 }
 
-await using var client = new ServiceBusClient(connectionString);
+var clientOptions = new ServiceBusClientOptions
+{
+    // AMQP-over-TCP needs outbound port 5671; on locked-down networks (e.g. ExpressRoute
+    // with no internet egress) only 443 is open, so tunnel AMQP through WebSockets.
+    TransportType = useWebSockets ? ServiceBusTransportType.AmqpWebSockets
+                                  : ServiceBusTransportType.AmqpTcp,
+    RetryOptions = new ServiceBusRetryOptions { TryTimeout = TimeSpan.FromSeconds(20), MaxRetries = 2 },
+};
+
+await using var client = new ServiceBusClient(connectionString, clientOptions);
 
 Console.WriteLine("=== ChipSbManager — Service Bus queue cleaner ===");
-Console.WriteLine($"Queue: {queueName}");
+Console.WriteLine($"Queue: {queueName} | transport: {clientOptions.TransportType}");
 await ShowQueueCountsAsync();
 Console.WriteLine();
 
@@ -56,10 +67,10 @@ while (true)
     switch (Console.ReadLine()?.Trim().ToLowerInvariant())
     {
         case "1":
-            await PreviewAsync();
+            await RunLoggedAsync("preview", PreviewAsync);
             break;
         case "2":
-            await DeleteAsync();
+            await RunLoggedAsync("delete", DeleteAsync);
             break;
         case "3":
             searchText = PromptForSearchText();
@@ -211,6 +222,36 @@ async Task DeleteAsync()
     Console.WriteLine("Note: re-queued clones carry an extra application property " +
                       $"'{RunIdProperty}' and a new enqueue time/sequence number.");
     await ShowQueueCountsAsync();
+}
+
+async Task RunLoggedAsync(string operation, Func<Task> action)
+{
+    try
+    {
+        await action();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"ERROR during {operation}:");
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            Console.WriteLine($"  [{e.GetType().Name}] {e.Message}");
+            if (e is ServiceBusException sbe)
+                Console.WriteLine($"    reason: {sbe.Reason}, transient: {sbe.IsTransient}");
+        }
+
+        if (ex is ServiceBusException { Reason: ServiceBusFailureReason.ServiceCommunicationProblem }
+            or ServiceBusException { Reason: ServiceBusFailureReason.ServiceTimeout }
+            or OperationCanceledException)
+        {
+            Console.WriteLine();
+            Console.WriteLine("This looks like a network/connectivity problem. The default AMQP transport");
+            Console.WriteLine("needs outbound TCP port 5671, which is often blocked on restricted networks.");
+            Console.WriteLine("Try setting \"ServiceBus\": { \"UseWebSockets\": true } in appsettings.json");
+            Console.WriteLine("to tunnel AMQP over port 443 instead (the port the queue counts already use).");
+        }
+    }
 }
 
 async Task ShowQueueCountsAsync()
