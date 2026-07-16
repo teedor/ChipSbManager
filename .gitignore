@@ -13,3 +13,4 @@ backups/
 .idea/
 *.user
 .DS_Store
+itemIds.csv
