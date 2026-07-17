@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Azure.Messaging.ServiceBus;
@@ -78,6 +80,7 @@ while (true)
     Console.WriteLine("  [4] Delete  — back up & delete matches, re-queue everything else");
     Console.WriteLine("  [5] Watch queue counts (refreshes every 10s)");
     Console.WriteLine("  [6] Switch queue");
+    Console.WriteLine("  [7] Analyze queue — why so many messages? (non-destructive)");
     Console.WriteLine("  [Q] Quit");
     Console.Write("> ");
 
@@ -102,6 +105,9 @@ while (true)
             break;
         case "6":
             await SelectQueueAsync();
+            break;
+        case "7":
+            await RunLoggedAsync("analyze", AnalyzeQueueAsync);
             break;
         case "q":
             await client.DisposeAsync();
@@ -296,6 +302,296 @@ async Task PreviewAsync()
     Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Scanned {scanned:N0} messages; {matched:N0} match the filter.");
     if (matchedDeferred > 0 || matchedScheduled > 0)
         Console.WriteLine($"  breakdown: {matchedActive:N0} active, {matchedDeferred:N0} deferred, {matchedScheduled:N0} scheduled — Delete handles all three.");
+}
+
+// Peeks every message on the queue (read-only) and writes a Markdown report of
+// aggregate statistics — enqueue-time histogram, message kinds, repeated ItemIds,
+// duplicate bodies — plus sample bodies, framed so the whole file can be pasted
+// into an LLM to answer "why are there so many messages on this queue?".
+async Task AnalyzeQueueAsync()
+{
+    await using var receiver = client.CreateReceiver(queueName);
+
+    var runtime = await TryGetRuntimePropertiesAsync();
+    var total = runtime?.ActiveMessageCount;
+    var started = Stopwatch.StartNew();
+
+    long scanned = 0, stateActive = 0, stateDeferred = 0, stateScheduled = 0, nonTextBodies = 0;
+    long sizeMin = long.MaxValue, sizeMax = 0, sizeSum = 0;
+    DateTimeOffset? oldest = null, newest = null;
+    var hourBuckets = new Dictionary<DateTime, long>();
+    var kinds = new Dictionary<string, KindStats>();
+    var itemIdCounts = new Dictionary<long, long>();
+    var bodyHashCounts = new Dictionary<string, long>();
+    var bodyHashSamples = new Dictionary<string, string>();
+    var propValueCounts = new Dictionary<string, Dictionary<string, long>>();
+
+    Console.WriteLine("Analyzing the queue (messages are peeked — not locked or modified)...");
+
+    long fromSequence = 0;
+    while (true)
+    {
+        var batch = await receiver.PeekMessagesAsync(BatchSize, fromSequence);
+        if (batch.Count == 0)
+            break;
+
+        foreach (var message in batch)
+        {
+            scanned++;
+            Aggregate(message);
+        }
+
+        fromSequence = batch[^1].SequenceNumber + 1;
+        WriteProgress($"  analyzed {Progress(scanned, total, started)}");
+    }
+    Console.WriteLine();
+
+    // Aggregate hourly while scanning; only collapse to daily buckets if the queue
+    // spans more than a few days, so the histogram stays readable either way.
+    var daily = oldest is not null && newest!.Value - oldest.Value > TimeSpan.FromDays(3);
+    var orderedBuckets = (daily
+            ? hourBuckets.GroupBy(kv => kv.Key.Date).Select(g => KeyValuePair.Create(g.Key, g.Sum(kv => kv.Value)))
+            : hourBuckets)
+        .OrderBy(kv => kv.Key).ToList();
+    var orderedKinds = kinds.OrderByDescending(kv => kv.Value.Count).ToList();
+    string BucketLabel(DateTime bucket) => daily ? $"{bucket:yyyy-MM-dd}" : $"{bucket:yyyy-MM-dd HH:00}";
+
+    Directory.CreateDirectory("analysis");
+    var reportPath = Path.Combine("analysis", $"{queueName}-{DateTime.Now:yyyyMMdd-HHmmss}.md");
+    var report = new StringBuilder();
+
+    report.AppendLine($"# Queue backlog analysis: {queueName}");
+    report.AppendLine();
+    report.AppendLine("You are analyzing an Azure Service Bus queue backlog. Below are aggregate");
+    report.AppendLine($"statistics and sample messages peeked (read-only) from the queue `{queueName}`,");
+    report.AppendLine("which holds far more messages than it normally does. Answer: **why are there");
+    report.AppendLine("so many messages on this queue?** Look for retry/poison loops (repeated");
+    report.AppendLine("ItemIds, duplicate bodies), producer surges (enqueue-time histogram), stuck or");
+    report.AppendLine("slow consumers (old oldest-message age with steady arrivals), and dominant");
+    report.AppendLine("message kinds. Suggest concrete next diagnostic or remediation steps.");
+    report.AppendLine();
+    report.AppendLine("## Queue counts");
+    report.AppendLine();
+    report.AppendLine($"- Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+    report.AppendLine(runtime is not null
+        ? $"- Active: {runtime.ActiveMessageCount:N0} | dead-lettered: {runtime.DeadLetterMessageCount:N0} | scheduled: {runtime.ScheduledMessageCount:N0}"
+        : "- Queue counts unavailable (connection string may lack Manage rights)");
+    report.AppendLine($"- Messages scanned (peeked): {scanned:N0} in {started.Elapsed:mm\\:ss}");
+    report.AppendLine($"- States seen: {stateActive:N0} active, {stateDeferred:N0} deferred, {stateScheduled:N0} scheduled");
+    if (scanned > nonTextBodies)
+        report.AppendLine($"- Body size (chars): min {sizeMin:N0}, avg {sizeSum / Math.Max(scanned - nonTextBodies, 1):N0}, max {sizeMax:N0}");
+    if (nonTextBodies > 0)
+        report.AppendLine($"- {nonTextBodies:N0} message(s) had bodies that could not be read as text");
+    if (scanned == 0)
+        report.AppendLine($"{Environment.NewLine}No messages were peeked — the queue appears to be empty.");
+
+    report.AppendLine();
+    report.AppendLine($"## Enqueue-time histogram ({(daily ? "per day" : "per hour")}, UTC)");
+    report.AppendLine();
+    if (oldest is not null)
+    {
+        report.AppendLine($"Oldest message: {oldest.Value.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC "
+                          + $"(age {(DateTimeOffset.UtcNow - oldest.Value).TotalHours:N1} h); "
+                          + $"newest: {newest!.Value.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC.");
+        report.AppendLine();
+    }
+    report.AppendLine("| Bucket (UTC) | Count |");
+    report.AppendLine("| --- | ---: |");
+    foreach (var (bucket, count) in orderedBuckets)
+        report.AppendLine($"| {BucketLabel(bucket)} | {count:N0} |");
+
+    report.AppendLine();
+    report.AppendLine("## Message kinds");
+    report.AppendLine();
+    report.AppendLine($"{kinds.Count:N0} distinct kind(s). Kind = Subject when set; otherwise the body's");
+    report.AppendLine("top-level JSON property names; otherwise the start of the body text.");
+    report.AppendLine();
+    report.AppendLine("| Kind | Count | % |");
+    report.AppendLine("| --- | ---: | ---: |");
+    foreach (var (kind, stats) in orderedKinds.Take(20))
+        report.AppendLine($"| {Cell(kind)} | {stats.Count:N0} | {stats.Count * 100.0 / Math.Max(scanned, 1):N1}% |");
+    if (orderedKinds.Count > 20)
+        report.AppendLine($"| (other {orderedKinds.Count - 20:N0} kinds) | {orderedKinds.Skip(20).Sum(kv => kv.Value.Count):N0} | |");
+
+    report.AppendLine();
+    report.AppendLine("## Top repeated ItemIds");
+    report.AppendLine();
+    if (itemIdCounts.Count == 0)
+    {
+        report.AppendLine("No `\"ItemId\":<number>` values found in message bodies.");
+    }
+    else
+    {
+        report.AppendLine($"{itemIdCounts.Count:N0} distinct ItemId(s) seen. High repetition of one ID suggests a retry/poison loop.");
+        report.AppendLine();
+        report.AppendLine("| ItemId | Occurrences |");
+        report.AppendLine("| --- | ---: |");
+        foreach (var (id, count) in itemIdCounts.OrderByDescending(kv => kv.Value).Take(20))
+            report.AppendLine($"| {id} | {count:N0} |");
+    }
+
+    report.AppendLine();
+    report.AppendLine("## Duplicate bodies");
+    report.AppendLine();
+    report.AppendLine($"Distinct bodies: {bodyHashCounts.Count:N0} of {scanned - nonTextBodies:N0} text bodies scanned.");
+    var dupes = bodyHashCounts.Where(kv => kv.Value >= 2).OrderByDescending(kv => kv.Value).Take(10).ToList();
+    if (dupes.Count > 0)
+    {
+        report.AppendLine();
+        report.AppendLine("| Copies | Sample (first 120 chars) |");
+        report.AppendLine("| ---: | --- |");
+        foreach (var (hash, count) in dupes)
+            report.AppendLine($"| {count:N0} | {Cell(bodyHashSamples[hash])} |");
+    }
+
+    report.AppendLine();
+    report.AppendLine("## Application properties");
+    report.AppendLine();
+    if (propValueCounts.Count == 0)
+    {
+        report.AppendLine("No application properties on any scanned message.");
+    }
+    else
+    {
+        report.AppendLine("| Property | Messages | Top values |");
+        report.AppendLine("| --- | ---: | --- |");
+        foreach (var (key, values) in propValueCounts.OrderByDescending(kv => kv.Value.Values.Sum()))
+        {
+            var top = string.Join("; ", values.OrderByDescending(kv => kv.Value).Take(5)
+                .Select(kv => $"{Cell(kv.Key)} ({kv.Value:N0})"));
+            report.AppendLine($"| {Cell(key)} | {values.Values.Sum():N0} | {top} |");
+        }
+    }
+
+    report.AppendLine();
+    report.AppendLine("## Sample bodies (top kinds, truncated to 1,000 chars)");
+    foreach (var (kind, stats) in orderedKinds.Take(5))
+    {
+        report.AppendLine();
+        report.AppendLine($"### Kind: {Cell(kind)} ({stats.Count:N0} messages)");
+        foreach (var sample in stats.Samples)
+        {
+            // Bodies can themselves contain ``` — use a longer fence when they do.
+            var fence = sample.Contains("```") ? "````" : "```";
+            report.AppendLine();
+            report.AppendLine(fence);
+            report.AppendLine(sample);
+            report.AppendLine(fence);
+        }
+    }
+
+    await File.WriteAllTextAsync(reportPath, report.ToString());
+
+    Console.WriteLine($"Done in {started.Elapsed:mm\\:ss}. Scanned {scanned:N0} messages"
+                      + (oldest is not null
+                          ? $" spanning {oldest.Value.UtcDateTime:yyyy-MM-dd HH:mm} → {newest!.Value.UtcDateTime:yyyy-MM-dd HH:mm} (UTC)"
+                          : "") + ".");
+    if (orderedKinds.Count > 0)
+        Console.WriteLine("Top kinds: " + string.Join(" | ", orderedKinds.Take(3).Select(kv => $"{kv.Key} ({kv.Value.Count:N0})")));
+    if (orderedBuckets.Count > 0)
+    {
+        var busiest = orderedBuckets.MaxBy(kv => kv.Value);
+        Console.WriteLine($"Busiest {(daily ? "day" : "hour")}: {BucketLabel(busiest.Key)} UTC — {busiest.Value:N0} messages");
+    }
+    Console.WriteLine($"Report: {reportPath}  (paste it into an LLM to get the \"why\" interpreted)");
+    return;
+
+    void Aggregate(ServiceBusReceivedMessage message)
+    {
+        switch (message.State)
+        {
+            case ServiceBusMessageState.Deferred: stateDeferred++; break;
+            case ServiceBusMessageState.Scheduled: stateScheduled++; break;
+            default: stateActive++; break;
+        }
+
+        var enqueued = message.EnqueuedTime;
+        if (oldest is null || enqueued < oldest) oldest = enqueued;
+        if (newest is null || enqueued > newest) newest = enqueued;
+        var t = enqueued.UtcDateTime;
+        var bucket = new DateTime(t.Year, t.Month, t.Day, t.Hour, 0, 0, DateTimeKind.Utc);
+        hourBuckets[bucket] = hourBuckets.GetValueOrDefault(bucket) + 1;
+
+        foreach (var (key, value) in message.ApplicationProperties)
+        {
+            if (!propValueCounts.TryGetValue(key, out var values))
+                propValueCounts[key] = values = new Dictionary<string, long>();
+            var text = value?.ToString() ?? "(null)";
+            if (text.Length > 40) text = text[..40] + "…";
+            // Cap distinct tracked values per key so GUID-valued properties can't balloon memory.
+            if (values.Count >= 50 && !values.ContainsKey(text))
+                text = "(other values)";
+            values[text] = values.GetValueOrDefault(text) + 1;
+        }
+
+        string body;
+        try
+        {
+            body = message.Body.ToString();
+        }
+        catch
+        {
+            nonTextBodies++;
+            AddKind("(non-text body)", "");
+            return;
+        }
+
+        sizeMin = Math.Min(sizeMin, body.Length);
+        sizeMax = Math.Max(sizeMax, body.Length);
+        sizeSum += body.Length;
+
+        foreach (Match m in itemIdRegex.Matches(body))
+        {
+            if (long.TryParse(m.Groups[1].Value, out var id))
+                itemIdCounts[id] = itemIdCounts.GetValueOrDefault(id) + 1;
+        }
+
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
+        bodyHashCounts[hash] = bodyHashCounts.GetValueOrDefault(hash) + 1;
+        if (!bodyHashSamples.ContainsKey(hash))
+            bodyHashSamples[hash] = body.Length > 120 ? body[..120] + "…" : body;
+
+        AddKind(KindOf(message, body), body);
+    }
+
+    void AddKind(string kind, string body)
+    {
+        if (!kinds.TryGetValue(kind, out var stats))
+            kinds[kind] = stats = new KindStats();
+        stats.Count++;
+        if (stats.Samples.Count < 3 && body.Length > 0)
+            stats.Samples.Add(body.Length > 1000 ? body[..1000] + "\n… [truncated]" : body);
+    }
+
+    static string KindOf(ServiceBusReceivedMessage message, string body)
+    {
+        if (!string.IsNullOrEmpty(message.Subject))
+            return $"subject: {message.Subject}";
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                var names = root.EnumerateObject().Select(p => p.Name)
+                    .OrderBy(n => n, StringComparer.Ordinal).ToList();
+                var shown = string.Join(", ", names.Take(12));
+                if (names.Count > 12) shown += ", …";
+                return $"json {{{shown}}}";
+            }
+            return root.ValueKind == JsonValueKind.Array ? "json array" : $"json {root.ValueKind}";
+        }
+        catch (JsonException)
+        {
+            var head = Regex.Replace(body.Trim(), @"\s+", " ");
+            if (head.Length > 60) head = head[..60] + "…";
+            return $"text: {head}";
+        }
+    }
+
+    // Markdown table cells can't contain newlines or unescaped pipes.
+    static string Cell(string text) => Regex.Replace(text, @"\s+", " ").Replace("|", "\\|");
 }
 
 async Task DeleteAsync()
@@ -637,16 +933,18 @@ async Task ShowQueueCountsAsync()
 }
 
 async Task<long?> TryGetActiveCountAsync()
+    => (await TryGetRuntimePropertiesAsync())?.ActiveMessageCount;
+
+async Task<QueueRuntimeProperties?> TryGetRuntimePropertiesAsync()
 {
     try
     {
         var admin = new ServiceBusAdministrationClient(connectionString);
-        var props = (await admin.GetQueueRuntimePropertiesAsync(queueName)).Value;
-        return props.ActiveMessageCount;
+        return (await admin.GetQueueRuntimePropertiesAsync(queueName)).Value;
     }
     catch
     {
-        return null; // no Manage rights — progress shows counts without percentage/ETA
+        return null; // no Manage rights — callers degrade gracefully (no %/ETA, no counts)
     }
 }
 
@@ -691,3 +989,11 @@ StringComparison PromptForCaseSensitivity()
 }
 
 record QueueEntry(string QueueName, string ConnectionString, string Namespace);
+
+// Per-kind aggregate for the analyze report. A class (not a record) because Count
+// is incremented in place while the instance lives inside a dictionary.
+sealed class KindStats
+{
+    public long Count;
+    public List<string> Samples { get; } = new();
+}

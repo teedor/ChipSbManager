@@ -57,6 +57,16 @@ There is also a **watch** option that prints the queue's active /
 dead-lettered / scheduled counts every 10 seconds (one timestamped line per
 refresh, so you can see the trend during a big delete); press any key to stop.
 
+An **analyze** option answers "why are there so many messages on this queue?".
+It peeks every message (read-only, no filter needed) and writes a Markdown
+report to `analysis/<queue>-<timestamp>.md` with an enqueue-time histogram
+(when did the buildup start?), a breakdown of message kinds, the most-repeated
+`ItemId`s and duplicate bodies (retry/poison-loop indicators), application
+property distributions, and a few truncated sample bodies per kind. The report
+opens with a framing prompt so the whole file can be pasted straight into an
+LLM (e.g. Claude) for interpretation. Reports may contain message bodies, so
+`analysis/` is gitignored.
+
 Both operations show live progress (count, percentage, rate, ETA — percentage and
 ETA need Manage rights on the connection string to read the queue's total).
 
