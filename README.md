@@ -12,7 +12,11 @@ backing them up to a local file.
    cp appsettings.example.json appsettings.json
    ```
 
-   `appsettings.json` is gitignored so the connection string is never committed.
+   `appsettings.json` is gitignored so connection strings are never committed.
+   Multiple queues can be configured in the `ServiceBus:Queues` array (each
+   entry has its own `QueueName` and `ConnectionString`); the app asks which
+   one to work with at startup and offers a "switch queue" menu option. The
+   older single `ServiceBus:ConnectionString`/`QueueName` settings still work.
 
    On restricted networks (e.g. ExpressRoute with no internet egress) where
    outbound TCP port 5671 is blocked, set `"UseWebSockets": true` to tunnel
@@ -27,7 +31,9 @@ backing them up to a local file.
 
 ## Usage
 
-The app starts at a menu. Set a filter first (option 3 or 4):
+The app starts by picking a queue (automatic if only one is configured), then
+shows a menu ordered by workflow: set a filter (option 1 or 2), preview,
+delete. Filter types:
 
 - **Search text** — substring match against the message body, optionally
   case-sensitive.

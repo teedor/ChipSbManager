@@ -29,16 +29,15 @@ var config = new ConfigurationBuilder()
     .AddJsonFile("appsettings.json", optional: true)
     .Build();
 
-var connectionString = config["ServiceBus:ConnectionString"];
-var queueName = config["ServiceBus:QueueName"];
 var useWebSockets = bool.TryParse(config["ServiceBus:UseWebSockets"], out var ws) && ws;
 
-if (string.IsNullOrWhiteSpace(connectionString) || string.IsNullOrWhiteSpace(queueName)
-    || connectionString.Contains("<your-"))
+var queues = LoadQueueEntries();
+if (queues.Count == 0)
 {
     Console.WriteLine("Missing configuration.");
     Console.WriteLine("Copy appsettings.example.json to appsettings.json (next to the .csproj)");
-    Console.WriteLine("and fill in ServiceBus:ConnectionString and ServiceBus:QueueName.");
+    Console.WriteLine("and fill in the ServiceBus:Queues array (QueueName + ConnectionString per entry).");
+    Console.WriteLine("The older single ServiceBus:ConnectionString/QueueName settings also still work.");
     return 1;
 }
 
@@ -51,12 +50,12 @@ var clientOptions = new ServiceBusClientOptions
     RetryOptions = new ServiceBusRetryOptions { TryTimeout = TimeSpan.FromSeconds(20), MaxRetries = 2 },
 };
 
-await using var client = new ServiceBusClient(connectionString, clientOptions);
-
 Console.WriteLine("=== ChipSbManager — Service Bus queue cleaner ===");
-Console.WriteLine($"Queue: {queueName} | transport: {clientOptions.TransportType}");
-await ShowQueueCountsAsync();
-Console.WriteLine();
+
+ServiceBusClient client = null!;
+var connectionString = "";
+var queueName = "";
+await SelectQueueAsync();
 
 // Matches "ItemId":<digits>, in message bodies — the value is always followed by
 // a comma, so require it. Whitespace around the colon and key casing are tolerated.
@@ -67,49 +66,112 @@ var itemIdRegex = new Regex("\"ItemId\"\\s*:\\s*(\\d+)\\s*,", RegexOptions.Ignor
 var searchText = "";
 var comparison = StringComparison.OrdinalIgnoreCase;
 HashSet<long>? itemIds = null; // non-null → CSV item-ID filter is active
-var filterDescription = "(none — choose option 3 or 4 first)";
+var filterDescription = "(none — choose option 1 or 2 first)";
 
 while (true)
 {
     Console.WriteLine();
-    Console.WriteLine($"Filter: {filterDescription}");
-    Console.WriteLine("  [1] Preview — count matching messages (non-destructive)");
-    Console.WriteLine("  [2] Delete  — back up & delete matches, re-queue everything else");
-    Console.WriteLine("  [3] Filter by search text");
-    Console.WriteLine("  [4] Filter by CSV of item IDs (matches \"ItemId\":<id> in bodies)");
+    Console.WriteLine($"Queue: {queueName} | Filter: {filterDescription}");
+    Console.WriteLine("  [1] Set filter: search text");
+    Console.WriteLine("  [2] Set filter: CSV of item IDs (matches \"ItemId\":<id> in bodies)");
+    Console.WriteLine("  [3] Preview — count matching messages (non-destructive)");
+    Console.WriteLine("  [4] Delete  — back up & delete matches, re-queue everything else");
     Console.WriteLine("  [5] Watch queue counts (refreshes every 10s)");
+    Console.WriteLine("  [6] Switch queue");
     Console.WriteLine("  [Q] Quit");
     Console.Write("> ");
 
     switch (Console.ReadLine()?.Trim().ToLowerInvariant())
     {
         case "1":
+            SetTextFilter();
+            break;
+        case "2":
+            SetCsvFilter();
+            break;
+        case "3":
             if (FilterIsSet())
                 await RunLoggedAsync("preview", PreviewAsync);
             break;
-        case "2":
+        case "4":
             if (FilterIsSet())
                 await RunLoggedAsync("delete", DeleteAsync);
-            break;
-        case "3":
-            SetTextFilter();
-            break;
-        case "4":
-            SetCsvFilter();
             break;
         case "5":
             await RunLoggedAsync("watch", WatchCountsAsync);
             break;
+        case "6":
+            await SelectQueueAsync();
+            break;
         case "q":
+            await client.DisposeAsync();
             return 0;
     }
+}
+
+List<QueueEntry> LoadQueueEntries()
+{
+    var list = new List<QueueEntry>();
+
+    foreach (var section in config.GetSection("ServiceBus:Queues").GetChildren())
+        AddIfValid(section["QueueName"], section["ConnectionString"]);
+
+    // The original single-queue settings still work alongside the array.
+    AddIfValid(config["ServiceBus:QueueName"], config["ServiceBus:ConnectionString"]);
+
+    return list;
+
+    void AddIfValid(string? name, string? cs)
+    {
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(cs)
+            || cs.Contains("<your-") || name.Contains('<'))
+            return;
+        var ns = Regex.Match(cs, "Endpoint=sb://([^/;]+)", RegexOptions.IgnoreCase);
+        list.Add(new QueueEntry(name, cs, ns.Success ? ns.Groups[1].Value : "unknown namespace"));
+    }
+}
+
+async Task SelectQueueAsync()
+{
+    QueueEntry entry;
+    if (queues.Count == 1)
+    {
+        entry = queues[0];
+    }
+    else
+    {
+        Console.WriteLine();
+        Console.WriteLine("Configured queues:");
+        for (var i = 0; i < queues.Count; i++)
+            Console.WriteLine($"  [{i + 1}] {queues[i].QueueName}  ({queues[i].Namespace})");
+
+        while (true)
+        {
+            Console.Write($"Pick a queue [1-{queues.Count}]: ");
+            if (int.TryParse(Console.ReadLine()?.Trim(), out var choice)
+                && choice >= 1 && choice <= queues.Count)
+            {
+                entry = queues[choice - 1];
+                break;
+            }
+        }
+    }
+
+    if (client is not null)
+        await client.DisposeAsync();
+    connectionString = entry.ConnectionString;
+    queueName = entry.QueueName;
+    client = new ServiceBusClient(connectionString, clientOptions);
+
+    Console.WriteLine($"Queue: {queueName} ({entry.Namespace}) | transport: {clientOptions.TransportType}");
+    await ShowQueueCountsAsync();
 }
 
 bool FilterIsSet()
 {
     if (itemIds is not null || searchText.Length > 0)
         return true;
-    Console.WriteLine("No filter set yet — choose [3] to search by text or [4] to load a CSV of item IDs.");
+    Console.WriteLine("No filter set yet — choose [1] to search by text or [2] to load a CSV of item IDs.");
     return false;
 }
 
@@ -627,3 +689,5 @@ StringComparison PromptForCaseSensitivity()
         ? StringComparison.Ordinal
         : StringComparison.OrdinalIgnoreCase;
 }
+
+record QueueEntry(string QueueName, string ConnectionString, string Namespace);
