@@ -57,15 +57,11 @@ There is also a **watch** option that prints the queue's active /
 dead-lettered / scheduled counts every 10 seconds (one timestamped line per
 refresh, so you can see the trend during a big delete); press any key to stop.
 
-An **analyze** option answers "why are there so many messages on this queue?".
-It peeks every message (read-only, no filter needed) and writes a Markdown
-report to `analysis/<queue>-<timestamp>.md` with an enqueue-time histogram
-(when did the buildup start?), a breakdown of message kinds, the most-repeated
-`ItemId`s and duplicate bodies (retry/poison-loop indicators), application
-property distributions, and a few truncated sample bodies per kind. The report
-opens with a framing prompt so the whole file can be pasted straight into an
-LLM (e.g. Claude) for interpretation. Reports may contain message bodies, so
-`analysis/` is gitignored.
+An **analyze** option answers "why are there so many messages on this queue?"
+by peeking every message (read-only, no filter needed) and writing a Markdown
+report designed to be handed to an LLM — see
+[Analyzing a backlog](#analyzing-a-backlog-why-are-there-so-many-messages)
+below for a worked example.
 
 Both operations show live progress (count, percentage, rate, ETA — percentage and
 ETA need Manage rights on the connection string to read the queue's total).
@@ -74,6 +70,81 @@ Delete can optionally be limited to N messages per run. Stopping early — via t
 limit, Ctrl+C, or a crash — is always safe: each message is either untouched or
 fully processed, so simply run Delete again to continue where the last run
 stopped.
+
+## Analyzing a backlog (why are there so many messages?)
+
+When a queue that normally holds a handful of messages suddenly has thousands,
+pick **[7] Analyze queue** from the menu. No filter is needed — it scans
+everything. Peeking is completely non-destructive (nothing is locked, delivery
+counts are untouched), so it's always safe to run, even with consumers active.
+
+```
+> 7
+Analyzing the queue (messages are peeked — not locked or modified)...
+  analyzed 16,234 / ~16,234 (100%) | 210/s
+Done in 01:17. Scanned 16,234 messages spanning 2026-07-10 04:12 → 2026-07-17 09:46 (UTC).
+Top kinds: json {ItemId, MovementReference, Status} (14,982) | subject: DecisionNotification (1,101)
+Busiest day: 2026-07-15 UTC — 9,873 messages
+Report: analysis/myqueue-20260717-101110.md  (paste it into an LLM to get the "why" interpreted)
+```
+
+That console summary alone often points at the cause, but the full story is in
+the report. It opens with a framing prompt ("You are analyzing an Azure Service
+Bus queue backlog... why are there so many messages on this queue?") followed
+by the evidence, so the whole file can be pasted verbatim into Claude (or any
+LLM) — or piped through the Claude Code CLI:
+
+```sh
+claude -p < analysis/myqueue-20260717-101110.md
+```
+
+An excerpt of what the report contains:
+
+```markdown
+## Enqueue-time histogram (per day, UTC)
+
+Oldest message: 2026-07-10 04:12:09 UTC (age 173.6 h); newest: 2026-07-17 09:46:45 UTC.
+
+| Bucket (UTC) | Count |
+| --- | ---: |
+| 2026-07-10 | 312 |
+| 2026-07-15 | 9,873 |
+| 2026-07-16 | 4,988 |
+
+## Top repeated ItemIds
+
+3,207 distinct ItemId(s) seen. High repetition of one ID suggests a retry/poison loop.
+
+| ItemId | Occurrences |
+| --- | ---: |
+| 449594 | 4,120 |
+| 451022 | 17 |
+
+## Duplicate bodies
+
+Distinct bodies: 3,251 of 16,234 text bodies scanned.
+
+| Copies | Sample (first 120 chars) |
+| ---: | --- |
+| 4,120 | {"ItemId":449594,"MovementReference":"GB2026...","Status":"Retry"} |
+```
+
+Each section is a diagnostic signal:
+
+| Section | What it tells you |
+| --- | --- |
+| Enqueue-time histogram | *When* the buildup started. A cliff on one day with an old oldest-message age usually means the consumer stopped or slowed; a steady spread means arrivals simply outpace processing. |
+| Message kinds | *What* is piling up — grouped by Subject, or by the body's top-level JSON property names. One kind at ~100% means a single producer or flow is responsible. |
+| Top repeated ItemIds / duplicate bodies | The retry/poison-loop indicators. The same ItemId or identical body appearing thousands of times means something is re-sending the same work over and over. |
+| Application properties | Producer fingerprints — e.g. messages carrying `ChipSbManager.RequeueRunId` are clones from an earlier delete run by this tool. |
+| Sample bodies | Up to 3 truncated real examples per top kind, so the LLM (or you) can see what the messages actually are. |
+
+In the example above the answer jumps out even without an LLM: one `ItemId`
+accounts for 4,120 identical `"Status":"Retry"` messages — a poison-message
+retry loop that started on the 15th — which you could then clean up with the
+CSV filter (option 2) and Delete.
+
+Reports may contain message bodies, so `analysis/` is gitignored.
 
 ## How delete works (and why)
 
