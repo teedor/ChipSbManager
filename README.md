@@ -58,9 +58,10 @@ dead-lettered / scheduled counts every 10 seconds (one timestamped line per
 refresh, so you can see the trend during a big delete); press any key to stop.
 
 A **send** option puts a single message on the queue: paste the body (multi-line
-is fine), finish with a line containing only a dot (`.`), and confirm. If the
-body parses as JSON the message is sent with content type `application/json`;
-otherwise it is sent as plain text (with a note, in case a paste went wrong).
+is fine — the end of the paste is detected automatically), press Enter, and
+confirm. If the body parses as JSON the message is sent with content type
+`application/json`; otherwise it is sent as plain text (with a note, in case a
+paste went wrong).
 
 An **analyze** option answers "why are there so many messages on this queue?"
 by peeking every message (read-only, no filter needed) and writing a Markdown

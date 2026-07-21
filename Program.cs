@@ -745,11 +745,25 @@ async Task DeleteAsync()
 async Task SendMessageAsync()
 {
     Console.WriteLine();
-    Console.WriteLine($"Paste the message body to send to '{queueName}'.");
-    Console.WriteLine("Multi-line bodies are fine — finish with a line containing only a dot (.).");
+    Console.WriteLine($"Paste the message body to send to '{queueName}' and press Enter (Enter alone cancels).");
     var lines = new List<string>();
-    while (Console.ReadLine() is { } line && line.Trim() != ".")
+    if (Console.ReadLine() is { } first)
+        lines.Add(first);
+
+    // Multi-line pastes arrive as a burst of lines, so no explicit terminator is
+    // needed: keep reading as long as more input shows up within a short window.
+    while (lines.Count > 0 && !Console.IsInputRedirected)
+    {
+        var waitedMs = 0;
+        while (!Console.KeyAvailable && waitedMs < 400)
+        {
+            await Task.Delay(25);
+            waitedMs += 25;
+        }
+        if (!Console.KeyAvailable || Console.ReadLine() is not { } line)
+            break;
         lines.Add(line);
+    }
 
     var body = string.Join(Environment.NewLine, lines).Trim();
     if (body.Length == 0)
