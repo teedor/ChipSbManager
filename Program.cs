@@ -81,6 +81,7 @@ while (true)
     Console.WriteLine("  [5] Watch queue counts (refreshes every 10s)");
     Console.WriteLine("  [6] Switch queue");
     Console.WriteLine("  [7] Analyze queue — why so many messages? (non-destructive)");
+    Console.WriteLine("  [8] Send a message — paste a body to put on the queue");
     Console.WriteLine("  [Q] Quit");
     Console.Write("> ");
 
@@ -108,6 +109,9 @@ while (true)
             break;
         case "7":
             await RunLoggedAsync("analyze", AnalyzeQueueAsync);
+            break;
+        case "8":
+            await RunLoggedAsync("send", SendMessageAsync);
             break;
         case "q":
             await client.DisposeAsync();
@@ -736,6 +740,54 @@ async Task DeleteAsync()
     Console.WriteLine("Note: re-queued clones carry an extra application property " +
                       $"'{RunIdProperty}' and a new enqueue time/sequence number.");
     await ShowQueueCountsAsync();
+}
+
+async Task SendMessageAsync()
+{
+    Console.WriteLine();
+    Console.WriteLine($"Paste the message body to send to '{queueName}'.");
+    Console.WriteLine("Multi-line bodies are fine — finish with a line containing only a dot (.).");
+    var lines = new List<string>();
+    while (Console.ReadLine() is { } line && line.Trim() != ".")
+        lines.Add(line);
+
+    var body = string.Join(Environment.NewLine, lines).Trim();
+    if (body.Length == 0)
+    {
+        Console.WriteLine("Empty body — nothing sent.");
+        return;
+    }
+
+    var message = new ServiceBusMessage(body) { MessageId = Guid.NewGuid().ToString("N") };
+    if (IsJson(body))
+        message.ContentType = "application/json";
+    else
+        Console.WriteLine("Note: body is not valid JSON — it will be sent as plain text.");
+
+    Console.Write($"Send this {body.Length:N0}-char message to '{queueName}'? [y/N] ");
+    if (Console.ReadLine()?.Trim().ToLowerInvariant() != "y")
+    {
+        Console.WriteLine("Cancelled — nothing sent.");
+        return;
+    }
+
+    await using var sender = client.CreateSender(queueName);
+    await sender.SendMessageAsync(message);
+    Console.WriteLine($"Sent (MessageId {message.MessageId}).");
+    await ShowQueueCountsAsync();
+
+    static bool IsJson(string text)
+    {
+        try
+        {
+            JsonDocument.Parse(text).Dispose();
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 }
 
 async Task<(long ActiveCount, List<long> DeferredSequenceNumbers, List<ServiceBusReceivedMessage> Scheduled)>
